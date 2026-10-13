@@ -26,13 +26,34 @@ data class FireplaceState(
   val splitFlow: Boolean = false,
   val aux: Boolean = false,
   val pilot: Boolean = false,
+  /** Comes from the handheld remote's thermometer, relayed by the module. Whole degrees, in tenths. */
   val roomTemperature: Int? = null,
+  /**
+   * When the module last pushed a room reading (epoch ms). The remote only reports now and then,
+   * and the connect snapshot carries no age, so this stays null until a fresh reading arrives.
+   */
+  val roomUpdatedAt: Long? = null,
   val temperatureUnit: Int = 0,
+  /** Thermostat set point, in tenths of a degree in the module's unit. 0 when never set. */
+  val temperatureSet: Int = 0,
+  /** Undocumented; reads [BURNER_OUT] whenever the burner is out, other values while it lights or burns. */
+  val shMemory1: Int? = null,
   /** False until the module has sent its first state snapshot. */
   val synced: Boolean = false,
 ) {
-  val isOn: Boolean get() = mainMode != 0
+  val isOn: Boolean get() = mainMode != MODE_OFF
+  val isThermostat: Boolean get() = mainMode == MODE_THERMOSTAT
+  /** Null when the module hasn't reported burner state. Unfamiliar values count as burning. */
+  val burnerLit: Boolean? get() = shMemory1?.let { it != BURNER_OUT }
 }
+
+/** sh_memory_1 while the burner is out; seen when off and while the thermostat idles. */
+const val BURNER_OUT = 32672
+
+const val MODE_OFF = 0
+const val MODE_MANUAL = 1
+/** The module lights and idles the fire itself to hold [FireplaceState.temperatureSet]. */
+const val MODE_THERMOSTAT = 2
 
 enum class ConnectionStatus { Disconnected, Connecting, Connected }
 
@@ -52,6 +73,16 @@ class ProflameClient(private val scope: CoroutineScope) {
   private val _status = MutableStateFlow(ConnectionStatus.Disconnected)
   val status: StateFlow<ConnectionStatus> = _status.asStateFlow()
 
+  private val _remoteInControl = MutableStateFlow(false)
+  /**
+   * True while the handheld remote keeps re-sending its full state. It does that after it turns the
+   * fireplace on, about twice a second, until it turns it off again, and undoes every app command.
+   */
+  val remoteInControl: StateFlow<Boolean> = _remoteInControl.asStateFlow()
+
+  /** Arrival times of full-state messages after the connect snapshot, within [REPEAT_WINDOW_MS]. */
+  private val repeats = ArrayDeque<Long>()
+
   @Volatile private var socket: WebSocket? = null
   private var loop: Job? = null
 
@@ -67,6 +98,7 @@ class ProflameClient(private val scope: CoroutineScope) {
           sincePing = 0
         }
         delay(RETRY_DELAY_MS)
+        noteRepeat(null)
         sincePing += RETRY_DELAY_MS
         // Ping doubles as a liveness check; a dead socket fails and flips status to Disconnected.
         if (_status.value == ConnectionStatus.Connected && sincePing >= PING_INTERVAL_MS) {
@@ -78,6 +110,8 @@ class ProflameClient(private val scope: CoroutineScope) {
   }
 
   fun stop() {
+    synchronized(repeats) { repeats.clear() }
+    _remoteInControl.value = false
     loop?.cancel()
     loop = null
     socket?.close(1000, null)
@@ -85,7 +119,16 @@ class ProflameClient(private val scope: CoroutineScope) {
     _status.value = ConnectionStatus.Disconnected
   }
 
-  fun setPower(on: Boolean) = send("main_mode", if (on) 1 else 0)
+  fun setPower(on: Boolean) = send("main_mode", if (on) MODE_MANUAL else MODE_OFF)
+
+  /** Thermostat on hands control to the module; off turns the fireplace off rather than leaving it burning. */
+  fun setThermostat(on: Boolean, setPoint: Int? = null) {
+    if (on && setPoint != null) send("temperature_set", setPoint)
+    send("main_mode", if (on) MODE_THERMOSTAT else MODE_OFF)
+  }
+
+  /** [tenths] is in the module's own unit, like room_temperature. */
+  fun setTargetTemperature(tenths: Int) = send("temperature_set", tenths)
   fun setFlame(level: Int) = send("flame_control", level.coerceIn(0, 6))
   fun setFan(level: Int) = send("fan_control", level.coerceIn(0, 6))
   fun setLamp(level: Int) = send("lamp_control", level.coerceIn(0, 6))
@@ -105,6 +148,9 @@ class ProflameClient(private val scope: CoroutineScope) {
     _status.value = ConnectionStatus.Connecting
     val request = Request.Builder().url("ws://$host:$PORT/").build()
     socket = http.newWebSocket(request, object : WebSocketListener() {
+      /** The first JSON message is the full snapshot; later ones are pushed changes. */
+      private var snapshotSeen = false
+
       override fun onOpen(webSocket: WebSocket, response: Response) {
         _status.value = ConnectionStatus.Connected
         webSocket.send(PING)
@@ -114,14 +160,33 @@ class ProflameClient(private val scope: CoroutineScope) {
       override fun onMessage(webSocket: WebSocket, text: String) {
         if (!text.startsWith("{")) return // PROFLAMEPONG, PROFLAMECONNECTIONOPEN
         val json = runCatching { JSONObject(text) }.getOrNull() ?: return
+        val isSnapshot = !snapshotSeen
+        snapshotSeen = true
+        if (!isSnapshot && json.length() >= FULL_STATE_KEYS) noteRepeat(System.currentTimeMillis())
         _state.update { current ->
-          json.keys().asSequence().fold(current) { s, key -> s.withField(key, json.optInt(key)) }.copy(synced = true)
+          val next = json.keys().asSequence().fold(current) { s, key -> s.withField(key, json.optInt(key)) }
+          val roomUpdatedAt = when {
+            !json.has("room_temperature") -> current.roomUpdatedAt
+            !isSnapshot -> System.currentTimeMillis()
+            // A snapshot after a reconnect: the old time still holds only if the reading didn't change meanwhile.
+            next.roomTemperature == current.roomTemperature -> current.roomUpdatedAt
+            else -> null
+          }
+          next.copy(synced = true, roomUpdatedAt = roomUpdatedAt)
         }
       }
 
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = dropped(webSocket)
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = dropped(webSocket)
     })
+  }
+
+  /** Records a repeated full-state message at [at] (null just expires old ones) and updates [remoteInControl]. */
+  private fun noteRepeat(at: Long?) = synchronized(repeats) {
+    val now = System.currentTimeMillis()
+    at?.let(repeats::addLast)
+    while (repeats.isNotEmpty() && now - repeats.first() > REPEAT_WINDOW_MS) repeats.removeFirst()
+    _remoteInControl.value = repeats.size >= REPEATS_FOR_REMOTE
   }
 
   private fun dropped(webSocket: WebSocket) {
@@ -137,6 +202,10 @@ class ProflameClient(private val scope: CoroutineScope) {
     internal const val HANDSHAKE = "PROFLAMECONNECTION"
     private const val PING_INTERVAL_MS = 30_000L
     private const val RETRY_DELAY_MS = 3_000L
+    // Another client connecting triggers one full-state message; the remote sends ~10 per window.
+    private const val FULL_STATE_KEYS = 8
+    private const val REPEAT_WINDOW_MS = 5_000L
+    private const val REPEATS_FOR_REMOTE = 3
   }
 }
 
@@ -151,5 +220,7 @@ internal fun FireplaceState.withField(key: String, value: Int): FireplaceState =
   "pilot_mode" -> copy(pilot = value != 0)
   "room_temperature" -> copy(roomTemperature = value)
   "temperature_unit" -> copy(temperatureUnit = value)
+  "temperature_set" -> copy(temperatureSet = value)
+  "sh_memory_1" -> copy(shMemory1 = value)
   else -> this
 }

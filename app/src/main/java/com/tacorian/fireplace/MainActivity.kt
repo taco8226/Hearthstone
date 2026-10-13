@@ -2,18 +2,23 @@ package com.tacorian.fireplace
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.ui.Modifier
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.tacorian.fireplace.theme.FireplaceTheme
-import com.tacorian.fireplace.ui.FireplaceScreen
+import com.tacorian.fireplace.ui.FireplaceViewModel
+import com.tacorian.fireplace.ui.HearthstoneApp
+import com.tacorian.fireplace.ui.ThemeMode
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -28,7 +33,24 @@ class MainActivity : ComponentActivity() {
 
     enableEdgeToEdge()
     setContent {
-      FireplaceTheme { Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { FireplaceScreen() } }
+      val vm: FireplaceViewModel = viewModel()
+      val settings by vm.settings.collectAsStateWithLifecycle()
+      val dark = when (settings.theme) {
+        ThemeMode.System -> isSystemInDarkTheme()
+        ThemeMode.Light -> false
+        ThemeMode.Dark -> true
+      }
+
+      // Status and navigation bar icons follow the app's theme, not the system's.
+      DisposableEffect(dark) {
+        enableEdgeToEdge(
+          statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT) { dark },
+          navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT) { dark },
+        )
+        onDispose {}
+      }
+
+      FireplaceTheme(darkTheme = dark, dynamicColor = settings.dynamicColor) { HearthstoneApp(vm) }
     }
   }
 }
