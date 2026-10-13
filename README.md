@@ -34,7 +34,7 @@ fireplace.host=<module-ip>
 Then, with the phone connected and USB debugging enabled:
 
 ```fish
-cd ~/AndroidStudioProjects/Hearthstone
+cd ~/Projects/Hearthstone
 set -x JAVA_HOME /opt/android-studio/jbr
 gradle assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
