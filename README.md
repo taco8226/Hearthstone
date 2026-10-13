@@ -54,3 +54,7 @@ Notes for this machine:
 - `widget/HearthstoneWidget.kt`: Glance widget.
 - `notify/FireplaceService.kt`: foreground service and notification.
 - `design/`: source icon art (color and monochrome).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
